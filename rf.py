@@ -129,6 +129,9 @@ if __name__ == "__main__":
 
         wandb.log({f"lossbin_{i}": lossbin[i] / losscnt[i] for i in range(10)})
 
+        # save model
+        torch.save(rf.model.state_dict(), 'model.pt')
+
         rf.model.eval()
         with torch.no_grad():
             cond = torch.arange(0, 16).cuda() % 10
