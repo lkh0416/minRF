@@ -1,6 +1,6 @@
 # implementation of Rectified Flow for simple minded people like me.
 import argparse
-
+# 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
 import torch
 
 
