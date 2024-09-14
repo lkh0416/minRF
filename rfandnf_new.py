@@ -1,6 +1,6 @@
 # implementation of Rectified Flow for simple minded people like me.
 import argparse
-# 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
+
 import torch
 import torch.nn.functional as F
 
@@ -188,7 +188,7 @@ if __name__ == "__main__":
             optimizer.zero_grad()
             
             # Calculate forget loss
-            
+
             # calculate remember loss
             
             loss.backward()
