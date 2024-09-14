@@ -44,110 +44,33 @@ class RF:
             images.append(z)
         return images
 
-class RF_tame:
-    def __init__(self, model_taming, model, ln=True, th=0.15, dis=4.0):
-        self.model_taming = model_taming
-        self.model = model
-        self.ln = ln
-        self.th = th
-        self.dis = dis
+    def reverse_sample(self, y1, cond, null_cond=None, sample_steps=2, cfg=2.0):
+        """
+        이미지 Y1에서 noise Y0으로 역과정 추정
 
-    def forward(self, x_forget, c_forget, x_remember, c_remember):
-        # Estimate distribution on x_remember and model_taming
-        ## print(x_forget.shape) # torch.Size([256, 3, 32, 32])
-
-        criterion = torch.nn.MSELoss()
-
-        # Rough : remember
-        null_cond = torch.ones_like(c_remember) * 10
-        z = torch.randn_like(x_remember)
-        b = x_remember.size(0)
-        sample_steps = 1
+        y1: 초기 이미지 (torch.Tensor)
+        cond: 조건 (torch.Tensor)
+        null_cond: null 조건 (torch.Tensor), 필요 시 사용
+        sample_steps: 역방향 샘플링 단계 수 (default: 50)
+        cfg: Classifier-Free Guidance 설정 (default: 2.0)
+        """
+        b = y1.size(0)
         dt = 1.0 / sample_steps
-        dt = torch.tensor([dt] * b).to(x_remember.device).view([b, *([1] * len(x_remember.shape[1:]))])
-        for i in range(sample_steps, 0, -1):
+        dt = torch.tensor([dt] * b).to(y1.device).view([b, *([1] * len(y1.shape[1:]))])
+
+        z = y1
+        for i in range(1, sample_steps + 1):
             t = i / sample_steps
-            t = torch.tensor([t] * b).to(x_remember.device)
+            t = torch.tensor([t] * b).to(y1.device)
 
-            vc = self.model_taming(z, t, c_remember)
-            # if null_cond is not None:
-            #     vu = self.model_taming(z, t, null_cond)
-            #     vc = vu + self.dis * (vc - vu)
-            z = z - dt * vc
-        sample_remember = z
-
-        # Rough : forget
-        null_cond = torch.ones_like(c_forget) * 10
-        z = torch.randn_like(x_forget)
-        b = x_forget.size(0)
-        sample_steps = 1
-        dt = 1.0 / sample_steps
-        dt = torch.tensor([dt] * b).to(x_forget.device).view([b, *([1] * len(x_forget.shape[1:]))])
-        for i in range(sample_steps, 0, -1):
-            t = i / sample_steps
-            t = torch.tensor([t] * b).to(x_forget.device)
-
-            vc = self.model_taming(z, t, c_forget)
-            # if null_cond is not None:
-            #     vu = self.model_taming(z, t, null_cond)
-            #     vc = vu + self.dis * (vc - vu)
-            z = z - dt * vc
-        loss_forget = criterion(z, x_forget)
-
-        alpha = 0.1
-
-        # loss = loss_remember - alpha * loss_forget
-        # loss = - loss_forget
-        loss = loss_remember
-        
-        return loss, loss_remember.detach(), loss_forget.detach()
-
-
-########################
-        # print(z.shape)
-        # log_probs = F.log_softmax(z, dim=1)
-        # print(log_probs.shape)
-        # print(c_remember.shape)
-        # true_log_probs = log_probs.gather(dim=1, index=c_remember.unsqueeze(1))
-        # nll = -true_log_probs.mean()
-
-        # print(nll)
-########################
-
-        # calculate distance
-        # under threshold, break
-        # Calculate forgetting loss
-        # Calculate remembering loss
-        # Calculate total loss
-
-        return 0, 0, 0 # loss, loss_forget, loss_remember
-        
-        # z1 = torch.randn_like(x)
-        # zt = (1 - texp) * x + texp * z1
-        # vtheta = self.model(zt, t, cond)
-        # batchwise_mse = ((z1 - x - vtheta) ** 2).mean(dim=list(range(1, len(x.shape))))
-        # tlist = batchwise_mse.detach().cpu().reshape(-1).tolist()
-        # ttloss = [(tv, tloss) for tv, tloss in zip(t, tlist)]
-        # return batchwise_mse.mean(), ttloss
-
-    @torch.no_grad()
-    def sample(self, z, cond, null_cond=None, sample_steps=50, cfg=2.0):
-        b = z.size(0)
-        dt = 1.0 / sample_steps
-        dt = torch.tensor([dt] * b).to(z.device).view([b, *([1] * len(z.shape[1:]))])
-        images = [z]
-        for i in range(sample_steps, 0, -1):
-            t = i / sample_steps
-            t = torch.tensor([t] * b).to(z.device)
-
-            vc = self.model_taming(z, t, cond)
+            vc = self.model(z, t, cond)  # 조건을 적용한 velocity field 예측
             if null_cond is not None:
-                vu = self.model_taming(z, t, null_cond)
+                vu = self.model(z, t, null_cond)
                 vc = vu + cfg * (vc - vu)
 
-            z = z - dt * vc
-            images.append(z)
-        return images
+            z = z + dt * vc  # 역방향으로 진행
+
+        return z
 
 if __name__ == "__main__":
     # train class conditional RF on mnist.
@@ -237,12 +160,14 @@ if __name__ == "__main__":
     for param in model.parameters():
         param.requires_grad = False
 
-    rf_tame = RF_tame(model_taming, model, th=args.th)
+    # We have to tame 'model_taming' based on 'model'.
+    rf = RF(model)
+    rf_taminbg = RF(model_taming)
 
-    wandb.init(project=f"rf_taming_{dataset_name}")
+    wandb.init(project=f"rf_taming_new_{dataset_name}")
 
     optimizer = optim.SGD(model_taming.parameters(), lr=1e-3)
-    # criterion = torch.nn.MSELoss()
+    nll_loss = torch.nn.NLLLoss()
 
     for epoch in range(100):
         lossbin = {i: 0 for i in range(10)}
@@ -261,7 +186,11 @@ if __name__ == "__main__":
                 x_remember, c_remember = x_remember.cuda(), c_remember.cuda()
 
             optimizer.zero_grad()
-            loss, loss_remember, loss_forget = rf_tame.forward(x_forget, c_forget, x_remember, c_remember)
+            
+            # Calculate forget loss
+            
+            # calculate remember loss
+            
             loss.backward()
             optimizer.step()
 
@@ -289,13 +218,13 @@ if __name__ == "__main__":
     #     # save model
     #     torch.save(rf.model.state_dict(), 'model.pt')
 
-        rf_tame.model_taming.eval()
+        rf.model_taming.eval()
         with torch.no_grad():
             cond = torch.arange(0, 16).cuda() % 10
             uncond = torch.ones_like(cond) * 10
 
             init_noise = torch.randn(16, channels, 32, 32).cuda()
-            images = rf_tame.sample(init_noise, cond, uncond)
+            images = rf.sample(init_noise, cond, uncond)
             # image sequences to gif
             gif = []
             for image in images:
@@ -318,4 +247,4 @@ if __name__ == "__main__":
             last_img = gif[-1]
             last_img.save(f"contents/sample_{epoch}_last.png")
 
-        rf_tame.model_taming.train()
+        rf.model_taming.train()
