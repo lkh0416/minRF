@@ -130,7 +130,7 @@ if __name__ == "__main__":
         wandb.log({f"lossbin_{i}": lossbin[i] / losscnt[i] for i in range(10)})
 
         # save model
-        torch.save(rf.model.state_dict(), 'model.pt')
+        torch.save(rf.model.state_dict(), 'model_onestep.pt')
 
         rf.model.eval()
         with torch.no_grad():
@@ -138,7 +138,7 @@ if __name__ == "__main__":
             uncond = torch.ones_like(cond) * 10
 
             init_noise = torch.randn(16, channels, 32, 32).cuda()
-            images = rf.sample(init_noise, cond, uncond)
+            images = rf.sample(init_noise, cond, uncond, sample_steps=1)
             # image sequences to gif
             gif = []
             for image in images:
