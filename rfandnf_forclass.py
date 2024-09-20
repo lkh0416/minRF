@@ -1,8 +1,12 @@
-# implementation of Rectified Flow for simple minded people like me.
 import argparse
-
+import random
 import torch
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms
+
+import matplotlib.pyplot as plt
+from losses_minrf import elbo_loss, kl_divergence, compute_elbo_for_sample, compute_nll
 
 class RF:
     def __init__(self, model, ln=True):
@@ -63,112 +67,24 @@ class RF:
 
         return z
 
-def elbo_loss(rf, x, c, sample_steps):
-    """
-    Compute the ELBO for a given input x and conditional labels c.
-    Args:
-        rf: Reverse diffusion model (RF instance).
-        x: Input data (batch of images).
-        c: Conditional information (class labels).
-        sample_steps: Number of reverse diffusion steps.
-    
-    Returns:
-        elbo: ELBO approximation (loss) for the batch.
-    """
-    # Reverse sample to obtain z from x
-    z = rf.reverse_sample(x, c, sample_steps=sample_steps)
-    
-    # We use the model to predict the reverse process (denoising step) to estimate the loss
-    batch_size = x.size(0)
-    elbo_loss_total = 0.0
-    
-    for i in range(1, sample_steps + 1):
-        t = torch.tensor([i / sample_steps] * batch_size).to(x.device)
-        texp = t.view([batch_size, *([1] * len(x.shape[1:]))])
-        
-        # Add noise for current time step
-        z_noisy = (1 - texp) * x + texp * torch.randn_like(x)
-        
-        # Get model's prediction for the reverse step
-        vtheta = rf.model(z_noisy, t, c)
-        
-        # The target is the original sample minus the noise (similar to MSE)
-        target = torch.randn_like(x)
-        
-        # Compute the MSE between the model prediction and the true noise
-        elbo_loss_step = F.mse_loss(vtheta, target)
-        elbo_loss_total += elbo_loss_step
-    
-    # Return the average ELBO across all reverse diffusion steps
-    return elbo_loss_total / sample_steps
-
-def compute_elbo_for_sample(rf, z, c):
-    """
-    Compute the ELBO for a given sample z.
-    Args:
-        rf: Reverse diffusion model (RF instance).
-        z: Sampled latent representation.
-        c: Conditional information (class labels).
-    
-    Returns:
-        elbo: ELBO approximation (loss) for the sample.
-    """
-    # We use the model to predict the reverse process (denoising step) to estimate the loss
-    batch_size = z.size(0)
-    elbo_loss_total = 0.0
-    
-    for i in range(1, sample_steps + 1):
-        t = torch.tensor([i / sample_steps] * batch_size).to(z.device)
-        texp = t.view([batch_size, *([1] * len(z.shape[1:]))])
-        
-        # Add noise for current time step
-        z_noisy = (1 - texp) * z + texp * torch.randn_like(z)
-        
-        # Get model's prediction for the reverse step
-        vtheta = rf.model(z_noisy, t, c)
-        
-        # The target is the original sample minus the noise (similar to MSE)
-        target = torch.randn_like(z)
-        
-        # Compute the MSE between the model prediction and the true noise
-        elbo_loss_step = F.mse_loss(vtheta, target)
-        elbo_loss_total += elbo_loss_step
-    
-    # Return the average ELBO across all reverse diffusion steps
-    return elbo_loss_total / sample_steps
-
-def kl_divergence(mu_q, sigma_q, mu_p, sigma_p):
-    """Compute KL divergence between two Gaussian distributions"""
-    kl = torch.log(sigma_p / sigma_q) + (sigma_q**2 + (mu_q - mu_p)**2) / (2 * sigma_p**2) - 0.5
-    # print(kl)
-    # print(kl.shape)
-    return kl.sum(dim=0).mean()
-
-def kl_loss(rf, rf_taming, x_set, c_set, sample_steps):
-    # Get the reverse sample for both models
-    z_base = rf.reverse_sample(x_set, c_set, sample_steps=sample_steps)
-    z_taming = rf_taming.reverse_sample(x_set, c_set, sample_steps=sample_steps)
-
-    # Compute mean and variance (assuming a Gaussian distribution) for both
-    mean_taming = z_taming.mean(dim=[1, 2, 3])  # Compute the mean across spatial dimensions
-    std_taming = z_taming.std(dim=[1, 2, 3])    # Compute the standard deviation
-
-    mean_base = z_base.mean(dim=[1, 2, 3])
-    std_base = z_base.std(dim=[1, 2, 3])
-
-    # Compute the KL divergence between the "base" and "taming" distributions
-    kl_div = kl_divergence(mean_base, std_base, mean_taming, std_taming)
-
-    return kl_div
+def show_images(images, title):
+    images = images * 0.5 + 0.5
+    images = images.clamp(0, 1)
+    # img = images.permute(1, 2, 0).cpu().numpy()
+    img = images.cpu().numpy()
+    img = (img * 255).astype(np.uint8)
+    grid_img = make_grid(images, nrow=10)
+    plt.figure(figsize=(10, 10))
+    plt.imshow(grid_img.permute(1, 2, 0))
+    plt.title(title)
+    plt.axis('off')
+    plt.savefig(title)
 
 if __name__ == "__main__":
-    # train class conditional RF on mnist.
     import numpy as np
     import torch.optim as optim
     from PIL import Image
     import copy
-    from torch.utils.data import DataLoader, Subset
-    from torchvision import datasets, transforms
     from torchvision.utils import make_grid
     from tqdm import tqdm
 
@@ -178,7 +94,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="use cifar?")
     parser.add_argument("--cifar", action="store_true")
-    parser.add_argument("--th", default=0.15, type=float)
+    parser.add_argument("--forget_percentage", default=0.5, type=float, help="Percentage of forget class to use for forgetting")
     args = parser.parse_args()
     CIFAR = args.cifar
 
@@ -213,29 +129,36 @@ if __name__ == "__main__":
         ).cuda()
 
     # model parameters
-    forget_threshold = 4.0  # δ from the paper
-    error_bound = 0.15 * forget_threshold  # ε = 0.15 * δ
-    alpha = 0.6  # Combination factor for losses, as indicated in the supplementary material
-    gamma = 0.6  # Factor for KL-divergence
-    learning_rate = 1e-1  # η
-    sample_steps = 5 # 5
-    batch_size = 16 # 8
+    forget_threshold = 1.0
+    alpha = 0.6  
+    gamma = 0.6  
+    learning_rate = 1e-1
+    sample_steps = 1
+    batch_size = 64
 
-    # Load CIFAR-10 dataset to check out the labels
-    # Class : ['airplane', 'automobile', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck']
+    # Load CIFAR-10 or MNIST dataset
     full_dataset = fdatasets(root="./data", train=True, download=True, transform=transform)
 
     # Define the specific class you want to separate (e.g., 'airplane' class, label 0)
-    forget_class = 0  # Label for 'airplane'
-    class_names = full_dataset.classes  # ['airplane', 'automobile', ..., 'truck']
+    forget_class = 0  # For CIFAR-10, 0 is 'airplane'. You can change this as needed.
+    class_names = full_dataset.classes
 
     # Separate the dataset into two subsets:
-    forget_class_indices = [i for i, (_, label) in enumerate(full_dataset) if label == forget_class]
-    remember_class_indices = [i for i, (_, label) in enumerate(full_dataset) if label != forget_class]
-    
+    certain_class_indices = [i for i, (_, label) in enumerate(full_dataset) if label == forget_class]
+
+    # Define the portion of the forget class you want to forget (e.g., 50%)
+    forget_percentage = args.forget_percentage
+    num_forget_samples = int(len(certain_class_indices) * forget_percentage)
+
+    # Create the subset of certain_class_indices for forgetting
+    forget_subset_indices = certain_class_indices[:num_forget_samples]
+
+    # Create the subset of certain_class_indices for remembering
+    remember_subset_indices = certain_class_indices[num_forget_samples:]
+
     # Create Subsets
-    forget_class_dataset = Subset(full_dataset, forget_class_indices)
-    remember_class_dataset = Subset(full_dataset, remember_class_indices)
+    forget_class_dataset = Subset(full_dataset, forget_subset_indices)
+    remember_class_dataset = Subset(full_dataset, remember_subset_indices)
 
     # Check the sizes of the subsets
     print(f"Number of samples in forget class ({class_names[forget_class]}): {len(forget_class_dataset)}")
@@ -245,7 +168,16 @@ if __name__ == "__main__":
     forget_class_loader = DataLoader(forget_class_dataset, batch_size=batch_size, shuffle=True)
     remember_class_loader = DataLoader(remember_class_dataset, batch_size=batch_size, shuffle=True)
 
-    # load pretrained model for cifar 'model.pt'
+    #### Checking data
+    # Visualize forget_class_loader
+    forget_images, _ = next(iter(forget_class_loader))
+    show_images(forget_images, f"Forget Class ({class_names[forget_class]}).png")
+
+    # # Visualize 100 samples of remember_class_loader
+    # remember_images, _ = next(iter(remember_class_loader))
+    # show_images(remember_images[:100], "Remember Classes (100 samples).png")
+
+        # load pretrained model for cifar 'model.pt'
     model.load_state_dict(torch.load('model.pt'))
 
     model_size = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -290,13 +222,13 @@ if __name__ == "__main__":
                 for i in range(batch_size):
                     # Reverse sample for each individual sample
                     z = rf_taming.reverse_sample(x_remember[i:i+1], c_remember[i:i+1], sample_steps=sample_steps)
-                    elbo_loss_sample = compute_elbo_for_sample(rf_taming, z, c_remember[i:i+1])  # Assuming this is defined
+                    elbo_loss_sample = compute_elbo_for_sample(rf_taming, z, c_remember[i:i+1], sample_steps)  # Assuming this is defined
                     elbo_loss_batch.append(elbo_loss_sample)
 
                 elbo_mean_remember = torch.mean(torch.stack(elbo_loss_batch))  # Mean over batch
                 elbo_std_remember = torch.std(torch.stack(elbo_loss_batch))    # Standard deviation over batch
 
-                # print(elbo_mean_remember, elbo_std_remember)
+                print(f"elbo_mean_remember: {elbo_mean_remember}, elbo_std_remember: {elbo_std_remember}")
 
 
             ## calculating the actual forgetting loss
@@ -304,9 +236,13 @@ if __name__ == "__main__":
             for i in range(len(x_forget)):
                 # Reverse sample for each individual sample
                 z = rf_taming.reverse_sample(x_forget[i:i+1], c_forget[i:i+1], sample_steps=sample_steps)
-                elbo_loss_sample = elbo_loss(rf_taming, z, c_forget[i:i+1], sample_steps=sample_steps)  # Assuming this is defined
-                elbo = (elbo_loss_sample - elbo_mean_remember - forget_threshold * elbo_std_remember) / elbo_std_remember
+                print(f"z mean : {z.mean()}, z std : {z.std()}")
+                elbo_loss_sample = compute_elbo_for_sample(rf_taming, z, c_forget[i:i+1], sample_steps=sample_steps)  # Assuming this is defined
+                # elbo = (elbo_loss_sample - elbo_mean_remember - forget_threshold * elbo_std_remember) / elbo_std_remember
+                # elbo = elbo_loss_sample
+                elbo = (elbo_loss_sample - elbo_mean_remember - forget_threshold * elbo_std_remember)
                 single_loss = torch.sigmoid((elbo_std_remember**2) * (elbo**2))
+                print(f"elbo: {elbo.item()}, loss: {single_loss.item()}")
                 loss_forget += single_loss
             
 
@@ -314,6 +250,43 @@ if __name__ == "__main__":
             # print(((elbo_std_remember**2) * (elbo**2)).item())
 
             # loss_forget = torch.sigmoid((elbo_std_remember**2) * (elbo**2)) / batch_size
+            loss_forget = loss_forget / len(x_forget)
+            
+            # # Calculate forget loss
+            # nll_likelihood = compute_nll(rf_taming, x_forget, c_forget, sample_steps)
+
+            # with torch.no_grad():
+            #     nll_loss_batch = []
+            #     for i in range(batch_size):
+            #         # Reverse sample for each individual sample
+            #         z = rf_taming.reverse_sample(x_remember[i:i+1], c_remember[i:i+1], sample_steps=sample_steps)
+            #         nll_loss_sample = compute_nll(rf_taming, z, c_remember[i:i+1], sample_steps)
+            #         nll_loss_batch.append(nll_loss_sample)
+
+            #     nll_mean_remember = torch.mean(torch.stack(nll_loss_batch))  # Mean over batch
+            #     nll_std_remember = torch.std(torch.stack(nll_loss_batch))    # Standard deviation over batch
+
+            #     print(nll_mean_remember, nll_std_remember)
+
+
+            # ## calculating the actual forgetting loss
+            # loss_forget = 0.0
+            # for i in range(len(x_forget)):
+            #     # Reverse sample for each individual sample
+            #     z = rf_taming.reverse_sample(x_forget[i:i+1], c_forget[i:i+1], sample_steps=sample_steps)
+            #     nll_loss_sample = compute_nll(rf_taming, z, c_forget[i:i+1], sample_steps)
+            #     print(nll_loss_sample.item(), end=" ")
+            #     nll = (nll_loss_sample - nll_mean_remember - forget_threshold * nll_std_remember) / nll_std_remember
+            #     print(nll.item(), end=" ")
+            #     single_loss = torch.sigmoid((nll_std_remember**2) * (nll**2))
+            #     print(single_loss)
+            #     loss_forget += single_loss
+            
+
+            # print(nll.item())
+            # print(((nll_std_remember**2) * (nll**2)).item())
+
+            # loss_forget = torch.sigmoid((nll_std_remember**2) * (nll**2)) / batch_size
             loss_forget = loss_forget / len(x_forget)
 
             # # calculate remember loss
@@ -325,21 +298,25 @@ if __name__ == "__main__":
             # caculate total loss
             # loss  = alpha * loss_forget + (1 - alpha) * loss_remember
             loss = loss_forget
+            # loss = loss_remember
 
             loss.backward()
             optimizer.step()
 
             # wandb.log({"loss": loss.item()})
-            wandb.log({"loss": loss.item(), "loss_forget": loss_forget.item()})
+            # wandb.log({"loss": loss.item(), "loss_remember": loss_remember.item()})
+            wandb.log({"loss": loss.item(), "loss_forget": loss_forget.item(), "elbo value": torch.abs(elbo).item()})
             # wandb.log({"loss": loss.item(), "loss_forget": loss_forget.item(), "loss_remember": loss_remember.item()})
 
         rf_taming.model.eval()
         with torch.no_grad():
-            cond = torch.arange(0, 16).cuda() % 10
+            cond = torch.tensor([forget_class] * 16).cuda()
             uncond = torch.ones_like(cond) * 10
 
             init_noise = torch.randn(16, channels, 32, 32).cuda()
+            # print(f"init_noise mean : {init_noise.mean()}, init_noise std : {init_noise.std()}")
             images = rf_taming.sample(init_noise, cond, uncond)
+            # print(f"images mean : {images[-1].mean()}, images std : {images[-1].std()}")
             # image sequences to gif
             gif = []
             for image in images:

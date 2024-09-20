@@ -120,6 +120,7 @@ if __name__ == "__main__":
 
             # count based on t
             for t, l in blsct:
+                print(t, l)
                 lossbin[int(t * 10)] += l
                 losscnt[int(t * 10)] += 1
 
@@ -130,7 +131,7 @@ if __name__ == "__main__":
         wandb.log({f"lossbin_{i}": lossbin[i] / losscnt[i] for i in range(10)})
 
         # save model
-        torch.save(rf.model.state_dict(), 'model_onestep.pt')
+        torch.save(rf.model.state_dict(), 'model_uncond.pt')
 
         rf.model.eval()
         with torch.no_grad():
